@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/dtinth/gojam/pkg/jamulusaudio"
@@ -18,6 +19,9 @@ type Client struct {
 	conn        *net.UDPConn
 	nextCounter uint8
 	decoder     *jamulusaudio.OpusDecoder
+	encoder     *jamulusaudio.OpusEncoder
+	audioCtr    uint8
+	audioIn     chan [332]byte
 	buffer      *jitterbuffer.JitterBuffer
 	closed      bool
 	info        jamulusprotocol.ChannelInfo
@@ -39,6 +43,9 @@ type Client struct {
 
 	// Print debug logging message
 	DebugLog func(string)
+
+	// Mute channels whose name has this prefix (e.g. "Snail_"). Empty = no muting.
+	MutePrefix string
 }
 
 // Creates a client
@@ -57,6 +64,13 @@ func NewClient(serverAddress string) (c *Client, err error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Create an encoder for sending audio
+	c.encoder, err = jamulusaudio.CreateEncoder(2)
+	if err != nil {
+		return nil, err
+	}
+	c.audioIn = make(chan [332]byte, 100)
 
 	// Create a jitter buffer
 	c.buffer = jitterbuffer.NewJitterBuffer(96)
@@ -80,7 +94,7 @@ func NewClient(serverAddress string) (c *Client, err error) {
 	c.debug("Connected!")
 	c.debug("Local address: %s", conn.LocalAddr())
 	c.debug("Remote address: %s", conn.RemoteAddr())
-	go c.sendSilence()
+	go c.sendLoop()
 	go c.handleIncomingPackets()
 	return
 }
@@ -95,17 +109,45 @@ func (c *Client) debug(format string, args ...interface{}) {
 	}
 }
 
-// Sends a silence packet to the server every 100ms
-func (c *Client) sendSilence() {
+// sendLoop sends audio at 48kHz / 256 samples per packet (~5.33ms per tick).
+// When audio is queued it sends that; otherwise falls back to silence.
+func (c *Client) sendLoop() {
 	silence := jamulusaudio.NewSilentOpusStream()
+	ticker := time.NewTicker(5333334 * time.Nanosecond)
+	defer ticker.Stop()
 	for !c.closed {
-		packet := silence.Next()
-		_, err := c.conn.WriteToUDP(packet[:], c.remoteAddr)
-		if err != nil {
-			c.debug("Error writing packet: %s", err)
+		<-ticker.C
+		select {
+		case pkt := <-c.audioIn:
+			c.conn.WriteToUDP(pkt[:], c.remoteAddr)
+		default:
+			sil := silence.Next()
+			c.conn.WriteToUDP(sil[:], c.remoteAddr)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// SendAudio encodes 512 interleaved stereo int16 samples (two 128-frame blocks)
+// and queues a Jamulus audio packet. Blocks when the queue is full.
+func (c *Client) SendAudio(pcm []int16) error {
+	if len(pcm) < 512 {
+		return fmt.Errorf("SendAudio: need 512 samples, got %d", len(pcm))
+	}
+	var packet [332]byte
+	n := c.encoder.Encode(pcm[:256], packet[0:165])
+	if n < 0 {
+		return fmt.Errorf("opus encode error: %d", n)
+	}
+	c.audioCtr++
+	packet[165] = c.audioCtr
+	n = c.encoder.Encode(pcm[256:512], packet[166:331])
+	if n < 0 {
+		return fmt.Errorf("opus encode error: %d", n)
+	}
+	c.audioCtr++
+	packet[331] = c.audioCtr
+	c.audioIn <- packet
+	return nil
 }
 
 // Handles incoming packets from the server
@@ -287,10 +329,26 @@ func (c *Client) handleConnClientsList(data []byte) {
 		c.HandleClientList(clients)
 	}
 
-	// Unmute all channels
 	for _, client := range clients {
-		c.unmute(client.ChannelId)
+		if c.MutePrefix != "" && strings.HasPrefix(client.Name, c.MutePrefix) {
+			c.mute(client.ChannelId)
+		} else {
+			c.unmute(client.ChannelId)
+		}
 	}
+}
+
+// Mutes a channel (gain = 0)
+func (c *Client) mute(channelId uint8) {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, uint8(channelId))
+	binary.Write(&buf, binary.LittleEndian, uint16(0x0000))
+	message := jamulusprotocol.Message{
+		Id:      jamulusprotocol.ChannelGain,
+		Counter: c.nextCounterValue(),
+		Data:    buf.Bytes(),
+	}
+	c.sendMessage(message)
 }
 
 // Unmutes a channel

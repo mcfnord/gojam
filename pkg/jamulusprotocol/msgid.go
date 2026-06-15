@@ -39,8 +39,9 @@ const (
 	ClmReqVersionAndOs      MsgId = 1012
 	ClmConnClientsList      MsgId = 1013
 	ClmReqConnClientsList   MsgId = 1014
-	ClmChannelLevelList     MsgId = 1015
-	ClmRegisterServerResp   MsgId = 1016
+	ClmChannelLevelList        MsgId = 1015
+	ClmReqChannelLevelList     MsgId = 1028
+	ClmRegisterServerResp      MsgId = 1016
 	ClmRegisterServerEx     MsgId = 1017
 	ClmRedServerList        MsgId = 1018
 )

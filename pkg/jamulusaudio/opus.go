@@ -65,3 +65,15 @@ func CreateEncoder(numChannels int) (*OpusEncoder, error) {
 
 	return &OpusEncoder{mode, encoder}, nil
 }
+
+// Encodes 128 stereo samples (256 int16 values, interleaved) into output.
+// Returns bytes written, or negative on error.
+func (e *OpusEncoder) Encode(pcm []int16, output []byte) int {
+	return int(C.opus_custom_encode(e.encoder, (*C.opus_int16)(&pcm[0]), 128, (*C.uchar)(&output[0]), C.int(len(output))))
+}
+
+// Destroys the encoder and frees resources.
+func (e *OpusEncoder) Destroy() {
+	C.opus_custom_encoder_destroy(e.encoder)
+	C.opus_custom_mode_destroy(e.mode)
+}
