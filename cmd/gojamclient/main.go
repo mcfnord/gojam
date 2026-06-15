@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -20,11 +22,13 @@ func main() {
 	// Parse command line arguments
 	server := flag.String("server", "127.0.0.1:22124", "server to connect to")
 	pcmout := flag.String("pcmout", "", "server to pipe PCM data to")
+	pcmin := flag.String("pcmin", "", "address to listen for PCM input to broadcast (e.g. localhost:22223)")
 	apiserver := flag.String("apiserver", "", "server to listen for API requests")
 	directory := flag.String("directory", "", "directory server perform UDP hole punching")
 	name := flag.String("name", "", "musician name")
 	vad := flag.Bool("vad", false, "do not send audio when there is no activity")
 	mp3 := flag.Bool("mp3", false, "encode mp3 and exposes via API server (requires ffmpeg)")
+	mutePrefix := flag.String("mute-prefix", "", "mute channels whose name starts with this prefix")
 
 	flag.Parse()
 
@@ -36,6 +40,10 @@ func main() {
 		panic(err)
 	}
 	fmt.Println("client:", client)
+
+	if *mutePrefix != "" {
+		client.MutePrefix = *mutePrefix
+	}
 
 	info := client.GetChannelInfo()
 	if *name != "" {
@@ -50,6 +58,10 @@ func main() {
 
 	if *pcmout != "" {
 		installPCMOut(soundPipe, *pcmout)
+	}
+
+	if *pcmin != "" {
+		installPCMIn(client, *pcmin)
 	}
 
 	if *apiserver != "" {
@@ -69,23 +81,29 @@ func main() {
 }
 
 func installPCMOut(pipe *soundPipe, pcmout string) {
-	conn, err := net.Dial("tcp", pcmout)
-	if err != nil {
-		panic(err)
-	}
 	outChan := make(chan []byte, 100)
 	go func() {
 		for {
-			data := <-outChan
-			_, err := conn.Write(data)
+			conn, err := net.Dial("tcp", pcmout)
 			if err != nil {
-				conn.Close()
-				panic(err)
+				time.Sleep(time.Second)
+				continue
+			}
+			for {
+				data := <-outChan
+				_, err := conn.Write(data)
+				if err != nil {
+					conn.Close()
+					break
+				}
 			}
 		}
 	}()
 	pipe.HandlePCMBytes = func(pcmBytes []byte) {
-		outChan <- pcmBytes
+		select {
+		case outChan <- pcmBytes:
+		default:
+		}
 	}
 }
 
@@ -290,6 +308,41 @@ func installAPIServer(client *gojam.Client, pipe *soundPipe, apiserver string, m
 			panic(err)
 		}
 	}()
+}
+
+func installPCMIn(client *gojam.Client, addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("pcmin: listening on", addr)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go handlePCMConn(client, conn)
+		}
+	}()
+}
+
+func handlePCMConn(client *gojam.Client, conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 1024) // 512 int16 = two 256-sample stereo frames
+	for {
+		_, err := io.ReadFull(conn, buf)
+		if err != nil {
+			return
+		}
+		pcm := make([]int16, 512)
+		for i := range pcm {
+			pcm[i] = int16(binary.LittleEndian.Uint16(buf[i*2:]))
+		}
+		if err := client.SendAudio(pcm); err != nil {
+			return
+		}
+	}
 }
 
 func jsonMarshal(event apiEvent) string {
